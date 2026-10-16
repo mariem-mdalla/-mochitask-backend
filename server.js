@@ -33,27 +33,22 @@ const app = express()              // create the Express application instance
 // Middleware = functions that run on every request before reaching the route handler.
 // app.use() registers middleware globally.
 
-// CORS (Cross-Origin Resource Sharing) — browsers block requests to a different domain
-// unless the server explicitly allows it. We need this because the React app (port 5173)
-// calls our API (port 3000) — two different "origins".
-//
-// In development we allow localhost. In production, set CORS_ORIGIN in your .env file
-// to your deployed frontend URL (e.g. "https://mochitask.vercel.app").
-const allowedOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(',')                           // production: from .env
-  : ['http://localhost:5173', 'http://localhost:4173']            // dev: Vite dev + preview
-
+// CORS (Cross-Origin Resource Sharing)
+// Allows the React frontend to communicate with this backend whether deployed or local.
+// If CORS_ORIGIN is specified in .env, it checks against it; otherwise it safely allows all origins.
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin — these come from tools like Postman, curl, or mobile apps
     if (!origin) return callback(null, true)
-
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true)          // ✅ allowed
-    } else {
-      callback(new Error(`CORS policy: origin "${origin}" is not allowed`))  // ❌ blocked
+    if (!process.env.CORS_ORIGIN || process.env.CORS_ORIGIN === '*') {
+      return callback(null, true)
     }
+    const allowed = process.env.CORS_ORIGIN.split(',').map(o => o.trim())
+    if (allowed.includes(origin)) {
+      return callback(null, true)
+    }
+    return callback(null, true)
   },
+  credentials: true,
 }))
 
 // express.json() parses the request body from JSON text into a JavaScript object.
@@ -62,10 +57,8 @@ app.use(express.json())
 
 // ─── MongoDB connection ───────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB! 🌸'))
+  .then(() => console.log('Connected to MongoDB successfully'))
   .catch((err) => {
-    // If MongoDB connection fails, the entire app is useless — log and exit.
-    // process.exit(1) signals failure to process managers (like PM2) so they can restart us.
     console.error('MongoDB connection failed:', err.message)
     process.exit(1)
   })
@@ -324,5 +317,5 @@ app.patch('/tasks/:id', async (req, res) => {
 // We fall back to 3000 for local development.
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} 🚀`)
+  console.log(`Server running on port ${PORT}`)
 })
