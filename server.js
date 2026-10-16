@@ -1,67 +1,328 @@
-require('dotenv').config()
-const express = require('express')
-const cors = require('cors')
-const mongoose = require('mongoose')
+// ─── server.js ────────────────────────────────────────────────────────────────
+// The Express backend for MochiTask.
+//
+// What this file does:
+//   1. Connects to MongoDB Atlas via Mongoose
+//   2. Defines the Task schema with proper validation rules
+//   3. Exposes four REST API routes the React frontend talks to
+//   4. Enforces user isolation — each user's tasks are private to them
+//
+// REST API overview:
+//   GET    /tasks      → return all tasks for the requesting user
+//   POST   /tasks      → create a new task for the requesting user
+//   PUT    /tasks/:id  → update a task's editable details (only if the user owns it)
+//   DELETE /tasks/:id  → delete a task (only if the user owns it)
+//   PATCH  /tasks/:id  → update a task's status (only if the user owns it)
+// ─────────────────────────────────────────────────────────────────────────────
 
-const app = express()
+require('dotenv').config()         // reads .env file and loads variables into process.env
+const dns       = require('dns')
+const express   = require('express')
+const cors      = require('cors')
+const mongoose  = require('mongoose')
 
-app.use(cors())
+// Fix for Windows / Node.js DNS SRV resolution bug with MongoDB Atlas:
+// By default, Node's c-ares resolver queries the local router, which often
+// refuses or drops SRV record queries (querySrv ECONNREFUSED / ENOTFOUND).
+// Setting reliable DNS servers ensures MongoDB SRV records resolve smoothly.
+dns.setServers(['8.8.8.8', '1.1.1.1'])
+
+const app = express()              // create the Express application instance
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
+// Middleware = functions that run on every request before reaching the route handler.
+// app.use() registers middleware globally.
+
+// CORS (Cross-Origin Resource Sharing) — browsers block requests to a different domain
+// unless the server explicitly allows it. We need this because the React app (port 5173)
+// calls our API (port 3000) — two different "origins".
+//
+// In development we allow localhost. In production, set CORS_ORIGIN in your .env file
+// to your deployed frontend URL (e.g. "https://mochitask.vercel.app").
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',')                           // production: from .env
+  : ['http://localhost:5173', 'http://localhost:4173']            // dev: Vite dev + preview
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin — these come from tools like Postman, curl, or mobile apps
+    if (!origin) return callback(null, true)
+
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true)          // ✅ allowed
+    } else {
+      callback(new Error(`CORS policy: origin "${origin}" is not allowed`))  // ❌ blocked
+    }
+  },
+}))
+
+// express.json() parses the request body from JSON text into a JavaScript object.
+// Without this, req.body would be undefined for POST/PATCH requests.
 app.use(express.json())
 
-// Connect to MongoDB
-// Replace this with your actual connection string from Atlas
+// ─── MongoDB connection ───────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('Connected to MongoDB! 🌸'))
-  .catch((err) => console.log('MongoDB error:', err))
+  .catch((err) => {
+    // If MongoDB connection fails, the entire app is useless — log and exit.
+    // process.exit(1) signals failure to process managers (like PM2) so they can restart us.
+    console.error('MongoDB connection failed:', err.message)
+    process.exit(1)
+  })
 
-// Define what a Task looks like in the database
-// This is called a Schema — like a TypeScript type but for the database
+// ─── Task Schema ──────────────────────────────────────────────────────────────
+// A Mongoose Schema defines the shape, types, and validation rules for documents
+// stored in the MongoDB "tasks" collection. Think of it as a database-level type.
 const taskSchema = new mongoose.Schema({
-  title: String,       // task title
-  priority: String,    // high, medium, low
-  category: String,    // Work, Personal, etc
-  status: String,      // todo, inprogress, done
-  dueDate: String,
+
+  // userId — every task is tagged with the owner's ID (sent by the frontend in X-User-ID header)
+  userId: {
+    type: String,
+    required: true,    // every task MUST have an owner — no anonymous tasks
+    index: true,       // create a database index on this field for fast lookups
+  },
+
+  title: {
+    type: String,
+    required: [true, 'Title is required'],          // [rule, error message]
+    trim: true,                                     // strip leading/trailing whitespace automatically
+    maxlength: [200, 'Title cannot exceed 200 characters'],
+  },
+
+  description: {
+    type: String,
+    default: '',
+    trim: true,
+    maxlength: [1000, 'Description cannot exceed 1000 characters'],
+  },
+
+  priority: {
+    type: String,
+    required: true,
+    enum: {
+      values: ['high', 'medium', 'low'],            // only these 3 strings are valid
+      message: 'Priority must be high, medium, or low',
+    },
+    default: 'medium',
+  },
+
+  category: {
+    type: String,
+    required: true,
+    enum: {
+      values: ['Personal', 'Work', 'Shopping', 'Learning'],
+      message: 'Category must be Personal, Work, Shopping, or Learning',
+    },
+    default: 'Personal',
+  },
+
+  status: {
+    type: String,
+    required: true,
+    enum: {
+      values: ['todo', 'inprogress', 'done'],
+      message: 'Status must be todo, inprogress, or done',
+    },
+    default: 'todo',   // all new tasks start in the "To Do" column
+  },
+
+  dueDate: {
+    type: String,
+    default: '',       // optional field — empty string means "no due date set"
+  },
+
+}, {
+  // timestamps: true automatically adds two fields to every document:
+  //   createdAt: Date — when the document was first saved
+  //   updatedAt: Date — when the document was last modified
+  timestamps: true,
 })
 
-// Create a Task model from the schema
-// This is what we use to talk to the database
+// mongoose.model() compiles the schema into a Model class.
+// We use this class to query the database (Task.find(), Task.save(), etc.)
 const Task = mongoose.model('Task', taskSchema)
 
-// GET - fetch all tasks from database
+// ─── Helper: extract and validate user identity ───────────────────────────────
+// Every route calls this to get the userId from the request headers.
+// If the header is missing, we immediately send a 401 and return null —
+// the route handler checks for null and returns early without touching the database.
+const getUserId = (req, res) => {
+  // req.headers is an object of all HTTP headers; custom headers are lowercase
+  const userId = req.headers['x-user-id']
+
+  if (!userId || userId.trim() === '') {
+    // 401 Unauthorized — the request is missing required identity information
+    res.status(401).json({ error: 'Missing X-User-ID header' })
+    return null    // signal to the caller that we've already sent a response
+  }
+
+  return userId.trim()
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+// GET /tasks — return all tasks belonging to this user
 app.get('/tasks', async (req, res) => {
-  const tasks = await Task.find() // get all tasks from MongoDB
-  res.json(tasks)
+  const userId = getUserId(req, res)
+  if (!userId) return     // getUserId already sent the 401 response; stop here
+
+  try {
+    // Task.find({ userId }) = "SELECT * FROM tasks WHERE userId = ?"
+    // .sort({ createdAt: -1 }) = newest tasks first (-1 = descending)
+    const tasks = await Task.find({ userId }).sort({ createdAt: -1 })
+    res.json(tasks)        // 200 OK with the array of task documents
+  } catch (err) {
+    // 500 Internal Server Error — something broke on our end
+    console.error('GET /tasks error:', err.message)
+    res.status(500).json({ error: 'Failed to fetch tasks' })
+  }
 })
 
-// POST - add a new task to database
+// POST /tasks — create a new task for this user
 app.post('/tasks', async (req, res) => {
-  const newTask = new Task({
-    title: req.body.title,
-    priority: req.body.priority,
-    category: req.body.category,
-    status: 'todo'
-  })
-  await newTask.save() // save to MongoDB
-  res.json(newTask)
+  const userId = getUserId(req, res)
+  if (!userId) return
+
+  try {
+    // Explicitly destructure only the fields we expect — never pass req.body directly.
+    // Blindly trusting req.body would let an attacker inject arbitrary fields.
+    const { title, description, priority, category, dueDate } = req.body
+
+    const newTask = new Task({
+      userId,               // tag this task with the requesting user's ID
+      title,
+      description: description || '',
+      priority,
+      category,
+      dueDate: dueDate || '',    // treat undefined/null dueDate as empty string
+      status: 'todo',            // new tasks always start in the To Do column
+    })
+
+    // .save() runs schema validation THEN writes to MongoDB.
+    // If validation fails (e.g. priority = "chaos"), it throws a ValidationError.
+    await newTask.save()
+
+    // 201 Created is the semantically correct status code for a newly created resource
+    res.status(201).json(newTask)
+  } catch (err) {
+    if (err.name === 'ValidationError') {
+      // 400 Bad Request — the data the client sent didn't pass our schema rules
+      // err.message contains all the validation failure descriptions from the schema
+      res.status(400).json({ error: err.message })
+    } else {
+      console.error('POST /tasks error:', err.message)
+      res.status(500).json({ error: 'Failed to create task' })
+    }
+  }
 })
 
-// DELETE - remove a task from database
+// PUT /tasks/:id — update a task's editable fields (ownership check via userId)
+app.put('/tasks/:id', async (req, res) => {
+  const userId = getUserId(req, res)
+  if (!userId) return
+
+  try {
+    const { title, description, priority, category, dueDate } = req.body
+
+    if (!title || !title.trim()) {
+      return res.status(400).json({ error: 'Title is required' })
+    }
+
+    const updated = await Task.findOneAndUpdate(
+      { _id: req.params.id, userId },
+      {
+        title: title.trim(),
+        description: description ? description.trim() : '',
+        priority,
+        category,
+        dueDate: dueDate || '',
+      },
+      {
+        returnDocument: 'after', // return the updated document (replaces deprecated new: true)
+        runValidators: true,
+      }
+    )
+
+    if (!updated) {
+      return res.status(404).json({ error: 'Task not found' })
+    }
+
+    res.json(updated)
+  } catch (err) {
+    if (err.name === 'ValidationError') {
+      res.status(400).json({ error: err.message })
+    } else {
+      console.error('PUT /tasks/:id error:', err.message)
+      res.status(500).json({ error: 'Failed to update task' })
+    }
+  }
+})
+
+// DELETE /tasks/:id — remove a task permanently
 app.delete('/tasks/:id', async (req, res) => {
-  await Task.findByIdAndDelete(req.params.id) // find by MongoDB id and delete
-  res.json({ message: 'Task deleted' })
+  const userId = getUserId(req, res)
+  if (!userId) return
+
+  try {
+    // findOneAndDelete with BOTH _id AND userId is the ownership check.
+    // Without userId in the filter, any user who knows a task's ID could delete it.
+    // With it, the query returns null if the task belongs to someone else → 404.
+    const deleted = await Task.findOneAndDelete({
+      _id: req.params.id,    // the :id from the URL e.g. /tasks/abc123
+      userId,                // must also belong to this user
+    })
+
+    if (!deleted) {
+      // 404 Not Found — either the task doesn't exist, or it belongs to a different user
+      return res.status(404).json({ error: 'Task not found' })
+    }
+
+    res.json({ message: 'Task deleted' })
+  } catch (err) {
+    console.error('DELETE /tasks/:id error:', err.message)
+    res.status(500).json({ error: 'Failed to delete task' })
+  }
 })
 
-// PATCH - update task status in database
+// PATCH /tasks/:id — update a task's status field (move between columns)
 app.patch('/tasks/:id', async (req, res) => {
-  const task = await Task.findByIdAndUpdate(
-    req.params.id,
-    { status: req.body.status }, // only update the status field
-    { returnDocument: 'after' } // return the updated task
-  )
-  res.json(task)
+  const userId = getUserId(req, res)
+  if (!userId) return
+
+  try {
+    const { status } = req.body   // only accept a status field — ignore everything else
+
+    // Manual validation before touching the database — cheaper than a round-trip
+    const validStatuses = ['todo', 'inprogress', 'done']
+    if (!status || !validStatuses.includes(status)) {
+      return res.status(400).json({ error: `Status must be one of: ${validStatuses.join(', ')}` })
+    }
+
+    // findOneAndUpdate finds by both ID and userId (ownership check — same pattern as delete)
+    const updated = await Task.findOneAndUpdate(
+      { _id: req.params.id, userId },   // filter: this task owned by this user
+      { status },                       // update: only change the status field
+      {
+        returnDocument: 'after', // return the updated document (replaces deprecated new: true)
+        runValidators: true,  // run schema validation on the update too
+      }
+    )
+
+    if (!updated) {
+      return res.status(404).json({ error: 'Task not found' })
+    }
+
+    res.json(updated)   // return the updated task so the frontend can sync
+  } catch (err) {
+    console.error('PATCH /tasks/:id error:', err.message)
+    res.status(500).json({ error: 'Failed to update task' })
+  }
 })
 
-app.listen(process.env.PORT || 3000, () => {
-    console.log('Server running on port 3000 🚀')
+// ─── Start server ─────────────────────────────────────────────────────────────
+// process.env.PORT is set automatically by hosting platforms (Render, Railway, Heroku, etc.)
+// We fall back to 3000 for local development.
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT} 🚀`)
 })

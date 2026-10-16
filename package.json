@@ -1,12 +1,14 @@
 {
   "name": "mochitask-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Express + MongoDB backend for MochiTask — a Kanban task manager",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "echo \"No tests yet\" && exit 0"
   },
-  "keywords": [],
+  "keywords": ["express", "mongodb", "rest-api", "kanban"],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
